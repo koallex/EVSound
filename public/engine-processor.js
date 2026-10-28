@@ -1,19 +1,18 @@
 /**
- * EVoice AudioWorkletProcessor — VW 1.9 TDI PD oriented
- * Multi-layer procedural diesel synthesis with smooth parameter interpolation.
+ * EVoice AudioWorklet — VW 1.9 TDI PD
+ * Goal: textured, irregular diesel character, not a pitched sine.
+ * Layers: filtered noise combustion, mechanical clatter, intake, turbo (air noise + weak tone)
  */
 class EngineProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
 
-    // Raw targets (from main thread)
     this.rpm = 850;
     this.load = 0;
     this.boost = 0;
     this.throttle = 0;
     this.engineState = 'OFF';
 
-    // Smoothed values (critical for no zipper / clicks)
     this.sRpm = 850;
     this.sLoad = 0;
     this.sBoost = 0;
@@ -21,42 +20,44 @@ class EngineProcessor extends AudioWorkletProcessor {
     this.sGain = 0;
     this.targetGain = 0;
 
-    // Profile
     this.cylinders = 4;
     this.idleRpm = 850;
     this.redlineRpm = 4800;
-    this.combustionGain = 0.6;
-    this.mechanicalGain = 0.38;
-    this.turboGain = 0.42;
-    this.dieselKnock = 0.7;
+    this.combustionGain = 0.7;
+    this.mechanicalGain = 0.45;
+    this.turboGain = 0.5;
+    this.dieselKnock = 0.75;
 
-    // Phases
-    this.combustionPhase = 0;
-    this.cyclePhase = 0;       // full engine cycle
-    this.turboPhase = 0;
-    this.mechPhase = 0;
+    this.firePhase = 0;
+    this.slowPhase = 0;
+    this.turboTonePhase = 0;
 
-    // For overrun / decel effects
     this.prevThrottle = 0;
     this.overrunEnv = 0;
 
-    // Simple one-pole filters state
-    this.lpState = 0;
-    this.hpState = 0;
+    // Filter states
+    this.combLp = 0;
+    this.combHp = 0;
+    this.mechLp = 0;
+    this.turboBp = 0;
+    this.turboLp = 0;
+    this.outLp = 0;
 
-    // Noise seed
-    this.noise = 0;
+    // Noise
+    this.nState = 1;
+
+    // Short delay for slight body / cabin feel (very small)
+    this.delayBuf = new Float32Array(64);
+    this.delayIdx = 0;
 
     this.port.onmessage = (e) => {
       const d = e.data;
       if (d.type !== 'params') return;
-
       if (d.rpm != null) this.rpm = d.rpm;
       if (d.load != null) this.load = d.load;
       if (d.boost != null) this.boost = d.boost;
       if (d.throttle != null) this.throttle = d.throttle;
       if (d.engineState != null) this.engineState = d.engineState;
-
       if (d.profile) {
         const p = d.profile;
         if (p.cylinders != null) this.cylinders = p.cylinders;
@@ -70,147 +71,158 @@ class EngineProcessor extends AudioWorkletProcessor {
     };
   }
 
-  // Cheap white noise
-  rand() {
-    this.noise = (this.noise * 16807 + 0) % 2147483647;
-    return (this.noise / 2147483647) * 2 - 1;
+  noise() {
+    // xorshift-ish
+    let x = this.nState | 0;
+    x ^= x << 13;
+    x ^= x >>> 17;
+    x ^= x << 5;
+    this.nState = x;
+    return (x | 0) / 2147483648;
   }
 
   process(inputs, outputs) {
-    const output = outputs[0];
-    const ch = output[0];
+    const ch = outputs[0][0];
     if (!ch) return true;
 
     const sr = sampleRate;
     const invSr = 1 / sr;
     const n = ch.length;
 
-    // --- Parameter smoothing (block-rate + per-sample friendly) ---
-    // Faster for rpm (needs to follow), slower for gain/boost
-    const rpmCoef = 1 - Math.exp(-25 * invSr * 128);
-    const loadCoef = 1 - Math.exp(-18 * invSr * 128);
-    const boostCoef = 1 - Math.exp(-12 * invSr * 128);
-    const thrCoef = 1 - Math.exp(-30 * invSr * 128);
-    const gainCoef = 1 - Math.exp(-15 * invSr * 128);
+    // Smooth params
+    this.sRpm += (this.rpm - this.sRpm) * 0.12;
+    this.sLoad += (this.load - this.sLoad) * 0.08;
+    this.sBoost += (this.boost - this.sBoost) * 0.05;
+    this.sThrottle += (this.throttle - this.sThrottle) * 0.15;
 
-    this.sRpm += (this.rpm - this.sRpm) * rpmCoef;
-    this.sLoad += (this.load - this.sLoad) * loadCoef;
-    this.sBoost += (this.boost - this.sBoost) * boostCoef;
-    this.sThrottle += (this.throttle - this.sThrottle) * thrCoef;
-
-    // Target gain by state
     let tg = 0;
-    if (this.engineState === 'STARTING') tg = 0.38;
-    else if (this.engineState === 'STOPPING') tg = 0.1;
+    if (this.engineState === 'STARTING') tg = 0.4;
+    else if (this.engineState === 'STOPPING') tg = 0.12;
     else if (this.engineState === 'OFF') tg = 0;
-    else tg = 0.42 + this.sLoad * 0.48; // IDLE / RUNNING
-
+    else tg = 0.38 + this.sLoad * 0.55;
     this.targetGain = tg;
-    this.sGain += (this.targetGain - this.sGain) * gainCoef;
+    this.sGain += (this.targetGain - this.sGain) * 0.04;
 
-    if (this.sGain < 0.0008 && this.targetGain < 0.0008) {
+    if (this.sGain < 0.001 && this.targetGain < 0.001) {
       ch.fill(0);
       return true;
     }
 
-    // Overrun detection (throttle drop)
-    const thrDelta = this.sThrottle - this.prevThrottle;
-    if (thrDelta < -0.08 && this.sRpm > this.idleRpm + 300) {
-      this.overrunEnv = Math.min(1, this.overrunEnv + (-thrDelta) * 2.5);
+    // Overrun
+    const dThr = this.sThrottle - this.prevThrottle;
+    if (dThr < -0.1 && this.sRpm > this.idleRpm + 400) {
+      this.overrunEnv = Math.min(1, this.overrunEnv - dThr * 2.8);
     }
-    this.overrunEnv *= 0.985; // decay
+    this.overrunEnv *= 0.992;
     this.prevThrottle = this.sThrottle;
 
-    // Firing rate (4-stroke)
+    // Firing rate
     const firesPerSec = (this.sRpm / 60) * (this.cylinders / 2);
-    const phaseInc = firesPerSec * invSr;
-    const cycleInc = (this.sRpm / 60) * invSr;
+    const fireInc = firesPerSec * invSr;
+    const slowInc = (this.sRpm / 120) * invSr; // half-speed mechanical
 
-    // Turbo frequency (rises with boost + rpm)
-    const turboFreq = 1400 + this.sBoost * 3800 + this.sRpm * 0.22;
+    // Turbo centre frequency (not pure pitch track)
+    const turboCentre = 2200 + this.sBoost * 2800 + Math.min(800, this.sRpm * 0.12);
+
+    // Load-dependent brightness
+    const bright = 0.35 + this.sLoad * 0.5;
 
     for (let i = 0; i < n; i++) {
-      // Advance phases
-      this.combustionPhase += phaseInc;
-      if (this.combustionPhase >= 1) this.combustionPhase -= 1;
+      this.firePhase += fireInc;
+      if (this.firePhase >= 1) this.firePhase -= 1;
+      this.slowPhase += slowInc;
 
-      this.cyclePhase += cycleInc;
-      this.mechPhase += cycleInc;
-      this.turboPhase += turboFreq * invSr;
+      const n1 = this.noise();
+      const n2 = this.noise();
 
-      const pulse = this.combustionPhase;
-
-      // ========== LAYER 1: Combustion (diesel character) ==========
-      // Soft attack + body + metallic knock tail
-      let comb = 0;
-      if (pulse < 0.045) {
-        // Sharp diesel ignition transient
-        const t = pulse / 0.045;
-        const env = Math.sin(t * Math.PI);
-        comb = env * (0.7 + this.sLoad * 0.55);
-        // High-frequency knock / clatter
-        comb += this.rand() * this.dieselKnock * 0.35 * env * (0.6 + this.sLoad * 0.5);
-      } else if (pulse < 0.18) {
-        // Body of the combustion event
-        const t = (pulse - 0.045) / 0.135;
-        const env = Math.exp(-t * 3.2);
-        comb = env * (0.35 + this.sLoad * 0.5);
-        comb += this.rand() * 0.07 * env;
-      } else if (pulse < 0.32) {
-        // Short residual
-        const t = (pulse - 0.18) / 0.14;
-        comb = Math.exp(-t * 4.5) * 0.08 * (0.4 + this.sLoad);
+      // ----- 1. Combustion: filtered noise burst at each firing -----
+      // Envelope: short, asymmetric, diesel-like
+      let env = 0;
+      const p = this.firePhase;
+      if (p < 0.06) {
+        env = Math.sin((p / 0.06) * Math.PI);           // attack
+      } else if (p < 0.22) {
+        env = Math.exp(-(p - 0.06) * 9);                 // decay
       }
 
-      // Slight cylinder imbalance (makes it more alive)
-      const cylId = Math.floor(this.combustionPhase * this.cylinders) % this.cylinders;
-      const imbalance = 1 + ((cylId % 2 === 0) ? 0.04 : -0.03);
-      comb *= imbalance;
+      // Slight random amplitude jitter per cycle (irregularity)
+      const jitter = 0.85 + (n2 * 0.15 + 0.5) * 0.3;
 
-      // ========== LAYER 2: Mechanical rumble + low end ==========
-      const mechBase =
-        Math.sin(this.mechPhase * 2 * Math.PI) * 0.16 +
-        Math.sin(this.mechPhase * 4 * Math.PI) * 0.09 +
-        Math.sin(this.mechPhase * 6 * Math.PI) * 0.04;
+      // Band-limited noise through crude HP + LP
+      let comb = n1;
+      this.combHp += (comb - this.combHp) * 0.55;       // remove DC / very low
+      comb = comb - this.combHp;
+      this.combLp += (comb - this.combLp) * (0.25 + bright * 0.25);
+      comb = this.combLp;
 
-      // Sub-rumble related to rpm
-      const sub = Math.sin(this.cyclePhase * Math.PI) * 0.12 * (0.5 + this.sLoad * 0.5);
+      // Add a bit of low thud (not a sine pitch)
+      const thud = (p < 0.08 ? (1 - p / 0.08) : 0) * (0.4 + this.sLoad * 0.4);
+      comb = comb * env * jitter * (0.7 + this.sLoad * 0.6) + n1 * thud * 0.25;
 
-      const mechanical = (mechBase + sub) * this.mechanicalGain * (0.45 + this.sLoad * 0.55);
+      // Knock / clatter emphasis on attack
+      if (p < 0.05) {
+        comb += n2 * this.dieselKnock * 0.4 * (1 - p / 0.05) * (0.5 + this.sLoad);
+      }
 
-      // ========== LAYER 3: Turbo ==========
+      // ----- 2. Mechanical layer: irregular low texture -----
+      // Not harmonic series — more like modulated noise + slow pulses
+      let mech = n2;
+      this.mechLp += (mech - this.mechLp) * 0.08;       // low-pass heavily
+      mech = this.mechLp;
+
+      // Slow amplitude modulation at engine speed (not pure tone)
+      const mod = 0.55 + 0.45 * Math.sin(this.slowPhase * 2 * Math.PI);
+      mech *= mod * (0.35 + this.sLoad * 0.5);
+
+      // Occasional light tick
+      if (p > 0.5 && p < 0.52) {
+        mech += n1 * 0.08 * (0.3 + this.sLoad);
+      }
+
+      // ----- 3. Turbo: mostly air noise, weak tonal component -----
       let turbo = 0;
-      if (this.sBoost > 0.03) {
-        const tw = Math.sin(this.turboPhase * 2 * Math.PI);
-        // Soft high-shelf character
-        turbo = tw * this.sBoost * this.turboGain * 0.19 * (0.5 + this.sLoad * 0.5);
-        // Air noise component
-        turbo += this.rand() * this.sBoost * 0.035;
+      if (this.sBoost > 0.04) {
+        // Broadband air
+        let air = n1;
+        // Crude band-pass around turboCentre
+        this.turboBp += (air - this.turboBp) * 0.4;
+        air = air - this.turboBp;
+        this.turboLp += (air - this.turboLp) * Math.min(0.5, turboCentre / sr * 8);
+        air = this.turboLp;
+
+        // Weak whistling component (not dominant)
+        this.turboTonePhase += turboCentre * invSr;
+        const tone = Math.sin(this.turboTonePhase * 2 * Math.PI) * 0.15;
+
+        turbo = (air * 0.85 + tone * 0.15) * this.sBoost * this.turboGain * (0.4 + this.sLoad * 0.5);
       }
 
-      // ========== LAYER 4: Overrun / decel texture ==========
-      let overrun = 0;
-      if (this.overrunEnv > 0.02) {
-        // Short crackles / pops on lift
-        const crackle = (this.rand() > 0.92 ? this.rand() * 0.6 : 0);
-        overrun = (crackle + this.rand() * 0.08) * this.overrunEnv * 0.45;
+      // ----- 4. Overrun crackle -----
+      let over = 0;
+      if (this.overrunEnv > 0.03) {
+        const pop = (n1 > 0.93) ? n2 * 0.7 : n1 * 0.05;
+        over = pop * this.overrunEnv * 0.5;
       }
 
-      // ========== Mix ==========
-      let sample =
-        comb * this.combustionGain * 0.72 +
-        mechanical +
+      // ----- Mix -----
+      let s =
+        comb * this.combustionGain * 0.8 +
+        mech * this.mechanicalGain +
         turbo +
-        overrun;
+        over;
 
-      // Very light low-pass to tame harshness (one-pole)
-      this.lpState += (sample - this.lpState) * 0.35;
-      sample = this.lpState * 0.75 + sample * 0.25;
+      // Tiny diffusion / body
+      const d = this.delayBuf[this.delayIdx];
+      this.delayBuf[this.delayIdx] = s * 0.3;
+      this.delayIdx = (this.delayIdx + 1) % this.delayBuf.length;
+      s += d * 0.25;
 
-      // Soft saturation (prevents digital harshness & clipping)
-      sample = Math.tanh(sample * 1.25) * this.sGain * 0.52;
+      // Soft output filter + saturation
+      this.outLp += (s - this.outLp) * 0.4;
+      s = this.outLp * 0.7 + s * 0.3;
+      s = Math.tanh(s * 1.1) * this.sGain * 0.55;
 
-      ch[i] = sample;
+      ch[i] = s;
     }
 
     return true;
