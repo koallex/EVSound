@@ -1,4 +1,4 @@
-import type { EngineProfile, EngineState, TransmissionMode, VehicleState } from '../types';
+import type { EngineProfile, TransmissionMode, VehicleState } from '../types';
 
 /**
  * Core vehicle / engine / gearbox simulation.
@@ -9,7 +9,6 @@ export class VehicleModel {
   private state: VehicleState;
   private targetSpeedKmh = 0;
   private simulationThrottle = 0;
-  private lastUpdateMs = 0;
 
   constructor(profile: EngineProfile) {
     this.profile = profile;
