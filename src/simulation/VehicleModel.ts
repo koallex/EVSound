@@ -104,12 +104,14 @@ export class VehicleModel {
       const accel = Math.max(-8, Math.min(6, speedError * 1.8 + this.simulationThrottle * 4));
       speedKmh = Math.max(0, speedKmh + accel * dt * 3.6); // rough m/s² → km/h
 
-      // Throttle estimate from acceleration demand + simulation
+      // Throttle: follow simulation pedal closely, with a bit of demand from speed error
       const demandedThrottle = Math.max(
         0,
-        Math.min(1, this.simulationThrottle * 0.7 + Math.max(0, speedError) * 0.08 + (speedKmh > 5 ? 0.15 : 0))
+        Math.min(1, this.simulationThrottle * 0.92 + Math.max(0, speedError) * 0.05)
       );
-      throttle += (demandedThrottle - throttle) * Math.min(1, dt * 4);
+      // Faster closing than opening (more natural lift-off)
+      const thrRate = demandedThrottle < throttle ? 8 : 5;
+      throttle += (demandedThrottle - throttle) * Math.min(1, dt * thrRate);
 
       // Gear selection (simple auto)
       if (!this.state.isShifting) {
@@ -146,17 +148,18 @@ export class VehicleModel {
       // Clamp
       rpm = Math.max(p.idleRpm * 0.7, Math.min(p.redlineRpm * 1.05, rpm));
 
-      // Load (simplified)
-      load = Math.max(0, Math.min(1, throttle * 0.85 + (rpm / p.redlineRpm) * 0.15));
+      // Load: primarily throttle, with slight rpm influence
+      const targetLoad = Math.max(0, Math.min(1, throttle * 0.88 + (rpm / p.redlineRpm) * 0.12));
+      load += (targetLoad - load) * Math.min(1, dt * 6);
 
-      // Turbo spool
+      // Turbo spool — slower spool up, faster spool down
       if (p.hasTurbo) {
-        const targetBoost = load > 0.25 ? Math.min(1, (load - 0.2) * 1.4) : 0;
-        const spoolRate = 1 / p.audio.turboSpoolTime;
+        const targetBoost = load > 0.22 ? Math.min(1, (load - 0.18) * 1.35) : 0;
+        const spoolRate = 1 / Math.max(0.4, p.audio.turboSpoolTime);
         if (targetBoost > boost) {
-          boost += (targetBoost - boost) * Math.min(1, dt * spoolRate * 2.5);
+          boost += (targetBoost - boost) * Math.min(1, dt * spoolRate * 2.2);
         } else {
-          boost += (targetBoost - boost) * Math.min(1, dt * spoolRate * 4);
+          boost += (targetBoost - boost) * Math.min(1, dt * spoolRate * 5.5);
         }
       } else {
         boost = 0;

@@ -6,7 +6,7 @@ import type { EngineProfile } from '../../types';
  * Source of technical data: public VW service literature, common knowledge of PD engines
  * (idle ~800–900 rpm, redline ~4500–5000 rpm, strong low-end torque, characteristic PD clatter).
  * Acoustic model is an approximation for educational / entertainment purposes.
- * Degree of acoustic fidelity: medium (procedural, tuned by ear, not measured IR).
+ * Degree of acoustic fidelity: medium-high (procedural, tuned for character).
  */
 export const vw19TdiPd: EngineProfile = {
   id: 'vw-19-tdi-pd',
@@ -24,20 +24,20 @@ export const vw19TdiPd: EngineProfile = {
   maxTorqueNm: 310,
   idleRpm: 850,
   redlineRpm: 4800,
-  firingIntervalFactor: 1.0, // 4-cyl 4-stroke
+  firingIntervalFactor: 1.0,
   hasTurbo: true,
-  gearRatios: [3.78, 2.12, 1.36, 0.97, 0.76], // typical 5-speed MQ200-ish approximation
+  gearRatios: [3.78, 2.12, 1.36, 0.97, 0.76],
   finalDrive: 3.39,
-  wheelRadiusM: 0.31, // ~195/65R15 approx
+  wheelRadiusM: 0.31,
   audio: {
-    baseFrequency: 28, // low fundamental for diesel
-    combustionGain: 0.55,
-    mechanicalGain: 0.35,
-    intakeGain: 0.25,
-    turboGain: 0.4,
-    exhaustLowGain: 0.7,
-    exhaustHighGain: 0.3,
-    turboSpoolTime: 1.4,
-    dieselKnockIntensity: 0.65,
+    baseFrequency: 26,
+    combustionGain: 0.62,
+    mechanicalGain: 0.40,
+    intakeGain: 0.22,
+    turboGain: 0.45,
+    exhaustLowGain: 0.72,
+    exhaustHighGain: 0.28,
+    turboSpoolTime: 1.35,
+    dieselKnockIntensity: 0.72,
   },
 };
